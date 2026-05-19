@@ -3,6 +3,7 @@ backend/venv/
 __pycache__/
 *.pyc
 .env
+backend/.env
 
 # Node / Next.js
 frontend/node_modules/
