@@ -1,0 +1,311 @@
+From 3351e847414797eb60590cd70b1ea8790548648d Mon Sep 17 00:00:00 2001
+From: arilui <plui0212@gmail.com>
+Date: Sun, 11 Oct 2026 09:23:33 -0700
+Subject: [PATCH] Prepare for Vercel deployment
+
+Configurable API URL and CORS origins, input limits, rate limiting,
+UTF-8 runtime requirements, and README deployment steps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CuDKGZWsbGgeuJfWYycwhZ
+---
+ README.md                    |  92 +++++++++++++++++++++++++++++++++++
+ backend/app.py               |  66 +++++++++++++++++++++----
+ backend/requirements-dev.txt |   2 +
+ backend/requirements.txt     | Bin 620 -> 47 bytes
+ frontend/app/page.tsx        |  22 ++++++++-
+ 5 files changed, 170 insertions(+), 12 deletions(-)
+ create mode 100644 README.md
+ create mode 100644 backend/requirements-dev.txt
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..5243806
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,92 @@
++# AI Incident CoPilot
++
++A full-stack tool that analyzes CI/CD pipeline logs, identifies likely failures, classifies severity, and drafts a postmortem.
++
++It uses a **hybrid, cost-aware design**: deterministic rules handle common, recognizable failures for free, and a language model is called only for logs that are complex, ambiguous, large, or high-risk.
++
++**Live demo:** _add your Vercel URL here_
++
++---
++
++## How It Works
++
++```text
++Pipeline logs
++     ↓
++Extract error lines + detect pipeline stage (rules)
++     ↓
++Routing: is this log complex?
++  (tracebacks, production, infra keywords, >2,500 chars, ≥4 errors, unknown stage)
++     ↓                                   ↓
++   No → rule-based analysis           Yes → GPT-4.1-mini with a strict JSON schema
++        (free, instant)                       ↓
++                                       On API failure or rate limit → rule-based fallback
++     ↓
++Severity, stage, top errors, suggested fix, postmortem
++```
++
++Every response reports which path was used (`analysis_mode`) and why (`ai_reason`), so the routing decision is visible in the UI.
++
++### Design decisions
++
++- **Rules first.** Most CI failures (a missing module, a failed test, a bad API key) match known patterns. Handling them without an LLM call keeps cost and latency near zero.
++- **Structured output.** The model must return JSON that matches a schema, so the frontend can render it without parsing free text.
++- **Graceful degradation.** If the OpenAI call fails or the per-IP AI quota is used up, the user still gets the rule-based analysis instead of an error.
++
++---
++
++## Tech Stack
++
++**Frontend:** Next.js, React, TypeScript, Tailwind CSS, lucide-react
++
++**Backend:** FastAPI, OpenAI API (`gpt-4.1-mini`, structured outputs)
++
++---
++
++## Running Locally
++
++### Backend
++
++```bash
++cd backend
++python -m venv venv
++source venv/bin/activate        # Windows: venv\Scripts\activate
++pip install -r requirements-dev.txt
++```
++
++Create `backend/.env` (optional; without a key, every log uses rule-based analysis):
++
++```env
++OPENAI_API_KEY=your_openai_api_key
++```
++
++Start the API:
++
++```bash
++python -m uvicorn app:app --reload
++```
++
++### Frontend
++
++```bash
++cd frontend
++npm install
++npm run dev
++```
++
++The app runs at `http://localhost:3000` and calls the API at `NEXT_PUBLIC_API_URL`, which defaults to `http://127.0.0.1:8000`.
++
++---
++
++## Deploying to Vercel
++
++The backend and frontend deploy as two Vercel projects from this one repository.
++
++1. **Backend project.** Import this repo in Vercel, set **Root Directory** to `backend`, and add these environment variables:
++   - `OPENAI_API_KEY`
++   - `ALLOWED_ORIGINS`: the frontend URL, for example `https://ai-incident-copilot.vercel.app`
++2. **Frontend project.** Import the repo again, set **Root Directory** to `frontend`, and add:
++   - `NEXT_PUBLIC_API_URL`: the backend URL
++3. **Cap spending.** Set a monthly budget limit in your OpenAI account. The per-IP AI quota (`AI_RATE_LIMIT`, default 5 calls per minute) is tracked per server instance, so the budget is the real cost cap.
++
++Logs are limited to 200,000 characters per request.
+diff --git a/backend/app.py b/backend/app.py
+index 1c9412c..31aec6a 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -1,29 +1,67 @@
+-from fastapi import FastAPI
++from collections import defaultdict, deque
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ from dotenv import load_dotenv
+ from openai import OpenAI
+ import os
+-import re
+ import json
++import time
+ 
+ load_dotenv()
+ 
+ app = FastAPI(title="AI Incident Copilot API")
+ 
++# Comma-separated list, e.g. "https://ai-incident-copilot.vercel.app,http://localhost:3000"
++ALLOWED_ORIGINS = [
++    origin.strip()
++    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
++    if origin.strip()
++]
++
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["http://localhost:3000"],
+-    allow_credentials=True,
+-    allow_methods=["*"],
+-    allow_headers=["*"],
++    allow_origins=ALLOWED_ORIGINS,
++    allow_methods=["GET", "POST"],
++    allow_headers=["Content-Type"],
+ )
+ 
+ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+ 
+ 
++MAX_LOG_CHARS = 200_000
++
++# LLM calls per IP per minute. Over the limit, requests fall back to the free
++# rule-based analysis instead of failing. On serverless this is tracked per
++# running instance, so the OpenAI account spending limit is the real cost cap.
++AI_RATE_LIMIT = int(os.getenv("AI_RATE_LIMIT", "5"))
++AI_RATE_WINDOW_SECONDS = 60
++_ai_calls: dict[str, deque] = defaultdict(deque)
++
++
++def ai_quota_available(client_ip: str) -> bool:
++    now = time.monotonic()
++    timestamps = _ai_calls[client_ip]
++
++    while timestamps and now - timestamps[0] > AI_RATE_WINDOW_SECONDS:
++        timestamps.popleft()
++
++    if len(timestamps) >= AI_RATE_LIMIT:
++        return False
++
++    timestamps.append(now)
++    return True
++
++
++def get_client_ip(request: Request) -> str:
++    forwarded = request.headers.get("x-forwarded-for")
++    if forwarded:
++        return forwarded.split(",")[0].strip()
++    return request.client.host if request.client else "unknown"
++
++
+ class LogRequest(BaseModel):
+-    logs: str
++    logs: str = Field(max_length=MAX_LOG_CHARS)
+ 
+ 
+ def extract_errors(logs: str):
+@@ -318,8 +356,8 @@ def root():
+ 
+ 
+ @app.post("/analyze")
+-def analyze_logs(request: LogRequest):
+-    logs = request.logs
++def analyze_logs(body: LogRequest, request: Request):
++    logs = body.logs
+ 
+     if not logs.strip():
+         return {
+@@ -346,6 +384,14 @@ def analyze_logs(request: LogRequest):
+ 
+     use_ai = should_use_ai(logs, errors, likely_stage)
+ 
++    if use_ai and not ai_quota_available(get_client_ip(request)):
++        fallback = rule_based_analysis(logs)
++        fallback["analysis_mode"] = "fallback"
++        fallback["ai_reason"] = (
++            "AI analysis is temporarily rate-limited, so rule-based analysis was used."
++        )
++        return fallback
++
+     if use_ai:
+         routing_reason = (
+             "AI selected because the logs appear complex, ambiguous, "
+diff --git a/backend/requirements-dev.txt b/backend/requirements-dev.txt
+new file mode 100644
+index 0000000..50eca92
+--- /dev/null
++++ b/backend/requirements-dev.txt
+@@ -0,0 +1,2 @@
++-r requirements.txt
++uvicorn>=0.30
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 17d3ae8ad3c57feb956c0f3b8ba2e5369e91560f..4c8baee2f2b62929a08770b9b14d53085dac2c09 100644
+GIT binary patch
+literal 47
+ycmYdGEG|hb$h5OH&@(hN<;pKe%}WIG4E0P6xC$yuGV=3uQ}Rnv^U6SC23!DW#txeR
+
+literal 620
+zcmZXS+it=@3`FO-5}!gvAY5MfmIy6dhzgsC1Oz|dcE)ByL={;p*~jBset&jI{2KJw
+z(IWPk(i#M8`OWZYR$_t=693sA546nd27YZhnSY?BnzTy#3oM3cz=^SdZ;Ni|7csL+
+zfjKAIg*DH#+>3~n5fOLhM%M1FLc)P`gDX9v3zDi;82v?!&Sq>$XEk-R8ki&5ViZ%v
+zyQ#U6^z6blm!{fs_C5W{dhm_SO;42X?47CDwdRUeNpxvFyyzZB66tvd-6Y{=v}RJq
+z+^YLL7w##tzPLQMUriVA>(o>@P)~1X*9z9Ls^nd0v#vYNsi=B4ZDs0`dX?kXTr$gd
+PbY+jare+(fzW#<kv-Di<
+
+diff --git a/frontend/app/page.tsx b/frontend/app/page.tsx
+index 4c426a5..a52435c 100644
+--- a/frontend/app/page.tsx
++++ b/frontend/app/page.tsx
+@@ -3,10 +3,13 @@
+ import { useState } from "react";
+ import { AlertTriangle, Activity, Wrench, Upload } from "lucide-react";
+ 
++const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
++
+ export default function Home() {
+   const [logs, setLogs] = useState("");
+   const [result, setResult] = useState<any>(null);
+   const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
+ 
+   const handleFileUpload = async (
+     event: React.ChangeEvent<HTMLInputElement>
+@@ -21,9 +24,10 @@ export default function Home() {
+ 
+   const analyzeLogs = async () => {
+     setLoading(true);
++    setError(null);
+ 
+     try {
+-      const response = await fetch("http://127.0.0.1:8000/analyze", {
++      const response = await fetch(`${API_URL}/analyze`, {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+@@ -32,9 +36,19 @@ export default function Home() {
+       });
+ 
+       const data = await response.json();
+-      setResult(data);
++
++      if (!response.ok) {
++        setError(
++          typeof data.detail === "string"
++            ? data.detail
++            : "These logs couldn't be analyzed. Logs are limited to 200,000 characters."
++        );
++      } else {
++        setResult(data);
++      }
+     } catch (error) {
+       console.error(error);
++      setError("Couldn't reach the analysis service. Please try again.");
+     }
+ 
+     setLoading(false);
+@@ -85,6 +99,10 @@ export default function Home() {
+             >
+               {loading ? "Analyzing..." : "Analyze Incident"}
+             </button>
++
++            {error && (
++              <p className="mt-3 text-sm text-red-400">{error}</p>
++            )}
+           </div>
+ 
+           <div className="space-y-6">
+-- 
+2.43.0
+

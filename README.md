@@ -4,7 +4,7 @@ A full-stack tool that analyzes CI/CD pipeline logs, identifies likely failures,
 
 It uses a **hybrid, cost-aware design**: deterministic rules handle common, recognizable failures for free, and a language model is called only for logs that are complex, ambiguous, large, or high-risk.
 
-**Live demo:** _add your Vercel URL here_
+   **Live demo:** https://ai-incident-copilot-9999.vercel.app
 
 ---
 
