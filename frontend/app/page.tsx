@@ -3,10 +3,13 @@
 import { useState } from "react";
 import { AlertTriangle, Activity, Wrench, Upload } from "lucide-react";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+
 export default function Home() {
   const [logs, setLogs] = useState("");
   const [result, setResult] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleFileUpload = async (
     event: React.ChangeEvent<HTMLInputElement>
@@ -21,9 +24,10 @@ export default function Home() {
 
   const analyzeLogs = async () => {
     setLoading(true);
+    setError(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/analyze", {
+      const response = await fetch(`${API_URL}/analyze`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -32,9 +36,19 @@ export default function Home() {
       });
 
       const data = await response.json();
-      setResult(data);
+
+      if (!response.ok) {
+        setError(
+          typeof data.detail === "string"
+            ? data.detail
+            : "These logs couldn't be analyzed. Logs are limited to 200,000 characters."
+        );
+      } else {
+        setResult(data);
+      }
     } catch (error) {
       console.error(error);
+      setError("Couldn't reach the analysis service. Please try again.");
     }
 
     setLoading(false);
@@ -85,6 +99,10 @@ export default function Home() {
             >
               {loading ? "Analyzing..." : "Analyze Incident"}
             </button>
+
+            {error && (
+              <p className="mt-3 text-sm text-red-400">{error}</p>
+            )}
           </div>
 
           <div className="space-y-6">

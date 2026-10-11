@@ -1,29 +1,67 @@
-from fastapi import FastAPI
+from collections import defaultdict, deque
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
-import re
 import json
+import time
 
 load_dotenv()
 
 app = FastAPI(title="AI Incident Copilot API")
 
+# Comma-separated list, e.g. "https://ai-incident-copilot.vercel.app,http://localhost:3000"
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
 
+MAX_LOG_CHARS = 200_000
+
+# LLM calls per IP per minute. Over the limit, requests fall back to the free
+# rule-based analysis instead of failing. On serverless this is tracked per
+# running instance, so the OpenAI account spending limit is the real cost cap.
+AI_RATE_LIMIT = int(os.getenv("AI_RATE_LIMIT", "5"))
+AI_RATE_WINDOW_SECONDS = 60
+_ai_calls: dict[str, deque] = defaultdict(deque)
+
+
+def ai_quota_available(client_ip: str) -> bool:
+    now = time.monotonic()
+    timestamps = _ai_calls[client_ip]
+
+    while timestamps and now - timestamps[0] > AI_RATE_WINDOW_SECONDS:
+        timestamps.popleft()
+
+    if len(timestamps) >= AI_RATE_LIMIT:
+        return False
+
+    timestamps.append(now)
+    return True
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 class LogRequest(BaseModel):
-    logs: str
+    logs: str = Field(max_length=MAX_LOG_CHARS)
 
 
 def extract_errors(logs: str):
@@ -318,8 +356,8 @@ def root():
 
 
 @app.post("/analyze")
-def analyze_logs(request: LogRequest):
-    logs = request.logs
+def analyze_logs(body: LogRequest, request: Request):
+    logs = body.logs
 
     if not logs.strip():
         return {
@@ -345,6 +383,14 @@ def analyze_logs(request: LogRequest):
     likely_stage = detect_stage(logs)
 
     use_ai = should_use_ai(logs, errors, likely_stage)
+
+    if use_ai and not ai_quota_available(get_client_ip(request)):
+        fallback = rule_based_analysis(logs)
+        fallback["analysis_mode"] = "fallback"
+        fallback["ai_reason"] = (
+            "AI analysis is temporarily rate-limited, so rule-based analysis was used."
+        )
+        return fallback
 
     if use_ai:
         routing_reason = (
